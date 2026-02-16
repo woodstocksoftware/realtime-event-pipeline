@@ -1,8 +1,11 @@
 """Tests for the Real-Time Event Pipeline."""
 
+import asyncio
 import os
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 # Ensure auth is disabled for most tests
@@ -145,6 +148,14 @@ class TestInputValidation:
         assert response.status_code == 400
         assert "timestamp" in response.json()["detail"].lower()
 
+    def test_payload_too_large_bytes(self, client):
+        response = client.post("/api/v1/events", json={
+            "event_type": "quiz_started",
+            "source": "quiz_engine",
+            "payload": {"data": "x" * 70000},
+        })
+        assert response.status_code == 422
+
 
 # ── Query Events ────────────────────────────────────────────────
 
@@ -211,6 +222,16 @@ class TestQueryEvents:
         events = client.get("/api/v1/events").json()
         assert events[0]["event_type"] == "answer_submitted"
         assert events[1]["event_type"] == "quiz_started"
+
+    def test_filter_by_since_returns_recent(self, client, sample_event):
+        client.post("/api/v1/events", json=sample_event)
+        response = client.get("/api/v1/events?since=2000-01-01T00:00:00Z")
+        assert len(response.json()) == 1
+
+    def test_filter_by_since_excludes_old(self, client, sample_event):
+        client.post("/api/v1/events", json=sample_event)
+        response = client.get("/api/v1/events?since=2099-01-01T00:00:00Z")
+        assert response.json() == []
 
 
 # ── Get Single Event ────────────────────────────────────────────
@@ -479,3 +500,378 @@ class TestWebSocketSubscribe:
             ws.send_json({"type": "ping"})
             response = ws.receive_json()
             assert response["type"] == "pong"
+
+
+# ── Readiness Failure ──────────────────────────────────────────
+
+
+class TestReadinessFailure:
+    def test_readiness_returns_503_on_db_failure(self, client, monkeypatch):
+        def broken_connection():
+            raise Exception("DB connection failed")
+
+        monkeypatch.setattr("src.database.get_connection", broken_connection)
+        response = client.get("/readiness")
+        assert response.status_code == 503
+        assert response.json()["ready"] is False
+
+
+# ── HSTS Header ────────────────────────────────────────────────
+
+
+class TestHSTSHeader:
+    def test_hsts_header_present_on_https(self):
+        with TestClient(app, base_url="https://testserver") as c:
+            response = c.get("/health")
+            assert "Strict-Transport-Security" in response.headers
+
+    def test_hsts_header_absent_on_http(self, client):
+        response = client.get("/health")
+        assert "Strict-Transport-Security" not in response.headers
+
+
+# ── WebSocket Publish Error Paths ──────────────────────────────
+
+
+class TestWebSocketPublishErrorPaths:
+    def test_publish_invalid_json(self, client):
+        with client.websocket_connect("/ws/publish") as ws:
+            ws.send_text("{not valid json")
+            response = ws.receive_json()
+            assert response["status"] == "error"
+            assert "Invalid JSON" in response["message"]
+
+    def test_publish_oversized_message(self, client, monkeypatch):
+        monkeypatch.setattr("src.config.MAX_WS_MESSAGE_BYTES", 50)
+        with client.websocket_connect("/ws/publish") as ws:
+            ws.send_text("x" * 200)
+            response = ws.receive_json()
+            assert response["status"] == "error"
+            assert "too large" in response["message"].lower()
+
+    def test_publish_internal_error(self, client, monkeypatch):
+        """Non-ValueError exceptions return generic 'Internal error'."""
+        def raise_runtime(**kwargs):
+            raise RuntimeError("DB crash")
+
+        monkeypatch.setattr("src.server.insert_event", raise_runtime)
+        with client.websocket_connect("/ws/publish") as ws:
+            ws.send_json({
+                "event_type": "quiz_started",
+                "source": "quiz_engine",
+            })
+            response = ws.receive_json()
+            assert response["status"] == "error"
+            assert response["message"] == "Internal error"
+
+
+# ── WebSocket Subscribe Error Paths ────────────────────────────
+
+
+class TestWebSocketSubscribeErrorPaths:
+    def test_subscribe_rejects_oversized_config(self, client, monkeypatch):
+        monkeypatch.setattr("src.config.MAX_WS_MESSAGE_BYTES", 10)
+        with client.websocket_connect("/ws/subscribe") as ws:
+            ws.send_text("x" * 200)
+            response = ws.receive_json()
+            assert response["status"] == "error"
+            assert "too large" in response["message"].lower()
+
+    def test_subscribe_rejects_invalid_json_config(self, client):
+        with client.websocket_connect("/ws/subscribe") as ws:
+            ws.send_text("{not valid json")
+            response = ws.receive_json()
+            assert response["status"] == "error"
+            assert "Invalid JSON" in response["message"]
+
+    def test_subscribe_at_server_capacity(self, client, monkeypatch):
+        from src.server import event_router
+
+        monkeypatch.setattr(event_router, "max_subscribers", 0)
+        with client.websocket_connect("/ws/subscribe") as ws:
+            ws.send_json({"event_types": ["quiz_started"]})
+            response = ws.receive_json()
+            assert response["status"] == "error"
+            assert "capacity" in response["message"].lower()
+
+    def test_update_filters(self, client):
+        with client.websocket_connect("/ws/subscribe") as ws:
+            ws.send_json({"event_types": ["quiz_started"]})
+            confirm = ws.receive_json()
+            assert confirm["status"] == "subscribed"
+
+            ws.send_json({
+                "type": "update_filters",
+                "filters": {"session_id": "new-session-789"},
+            })
+            response = ws.receive_json()
+            assert response["status"] == "filters_updated"
+            assert response["filters"]["session_id"] == "new-session-789"
+
+    def test_subscribe_oversized_message_in_loop(self, client, monkeypatch):
+        with client.websocket_connect("/ws/subscribe") as ws:
+            ws.send_json({"event_types": ["quiz_started"]})
+            ws.receive_json()  # confirmation
+
+            monkeypatch.setattr("src.config.MAX_WS_MESSAGE_BYTES", 10)
+            ws.send_text("x" * 200)
+            response = ws.receive_json()
+            assert response["status"] == "error"
+            assert "too large" in response["message"].lower()
+
+    def test_subscribe_invalid_json_in_loop(self, client):
+        with client.websocket_connect("/ws/subscribe") as ws:
+            ws.send_json({"event_types": ["quiz_started"]})
+            ws.receive_json()  # confirmation
+
+            ws.send_text("{not valid json")
+            # Server does `continue` on invalid JSON, so send a ping to verify alive
+            ws.send_json({"type": "ping"})
+            response = ws.receive_json()
+            assert response["type"] == "pong"
+
+
+# ── WebSocket Auth (direct middleware tests) ───────────────────
+
+
+class TestVerifyWsApiKey:
+    def test_rejects_missing_key(self, monkeypatch):
+        from src.middleware import verify_ws_api_key
+
+        monkeypatch.setattr("src.middleware.REQUIRE_AUTH", True)
+        monkeypatch.setattr("src.middleware.API_KEY", "secret-key")
+
+        mock_ws = MagicMock()
+        mock_ws.query_params = {}
+        mock_ws.headers = {}
+
+        with pytest.raises(HTTPException) as exc_info:
+            verify_ws_api_key(mock_ws)
+        assert exc_info.value.status_code == 401
+
+    def test_rejects_wrong_key(self, monkeypatch):
+        from src.middleware import verify_ws_api_key
+
+        monkeypatch.setattr("src.middleware.REQUIRE_AUTH", True)
+        monkeypatch.setattr("src.middleware.API_KEY", "secret-key")
+
+        mock_ws = MagicMock()
+        mock_ws.query_params = {"api_key": "wrong-key"}
+        mock_ws.headers = {}
+
+        with pytest.raises(HTTPException):
+            verify_ws_api_key(mock_ws)
+
+    def test_accepts_query_param_key(self, monkeypatch):
+        from src.middleware import verify_ws_api_key
+
+        monkeypatch.setattr("src.middleware.REQUIRE_AUTH", True)
+        monkeypatch.setattr("src.middleware.API_KEY", "secret-key")
+
+        mock_ws = MagicMock()
+        mock_ws.query_params = {"api_key": "secret-key"}
+        mock_ws.headers = {}
+
+        verify_ws_api_key(mock_ws)  # should not raise
+
+    def test_accepts_header_key(self, monkeypatch):
+        from src.middleware import verify_ws_api_key
+
+        monkeypatch.setattr("src.middleware.REQUIRE_AUTH", True)
+        monkeypatch.setattr("src.middleware.API_KEY", "secret-key")
+
+        mock_ws = MagicMock()
+        mock_ws.query_params = {}
+        mock_ws.headers = {"x-api-key": "secret-key"}
+
+        verify_ws_api_key(mock_ws)  # should not raise
+
+
+# ── WebSocket Connection Limiter ───────────────────────────────
+
+
+class TestWebSocketConnectionLimiterUnit:
+    def test_try_connect_at_limit(self):
+        from src.middleware import WebSocketConnectionLimiter
+
+        limiter = WebSocketConnectionLimiter(max_per_ip=2)
+        assert limiter.try_connect("1.2.3.4") is True
+        assert limiter.try_connect("1.2.3.4") is True
+        assert limiter.try_connect("1.2.3.4") is False
+
+    def test_disconnect_frees_slot(self):
+        from src.middleware import WebSocketConnectionLimiter
+
+        limiter = WebSocketConnectionLimiter(max_per_ip=1)
+        assert limiter.try_connect("1.2.3.4") is True
+        assert limiter.try_connect("1.2.3.4") is False
+        limiter.disconnect("1.2.3.4")
+        assert limiter.try_connect("1.2.3.4") is True
+
+    def test_disconnect_cleans_up_zero_connections(self):
+        from src.middleware import WebSocketConnectionLimiter
+
+        limiter = WebSocketConnectionLimiter(max_per_ip=5)
+        limiter.try_connect("1.2.3.4")
+        limiter.disconnect("1.2.3.4")
+        assert "1.2.3.4" not in limiter._connections
+
+    def test_different_ips_independent(self):
+        from src.middleware import WebSocketConnectionLimiter
+
+        limiter = WebSocketConnectionLimiter(max_per_ip=1)
+        assert limiter.try_connect("1.1.1.1") is True
+        assert limiter.try_connect("2.2.2.2") is True
+        assert limiter.try_connect("1.1.1.1") is False
+
+
+# ── EventRouter Async Tests ───────────────────────────────────
+
+
+class TestEventRouterAsync:
+    def test_start_creates_processor_task(self):
+        async def _test():
+            r = EventRouter(max_queue_size=100, max_subscribers=10)
+            r.start()
+            assert r._processor_task is not None
+            assert not r._processor_task.done()
+            r.stop()
+            await asyncio.sleep(0.05)
+
+        asyncio.run(_test())
+
+    def test_stop_cancels_task(self):
+        async def _test():
+            r = EventRouter(max_queue_size=100, max_subscribers=10)
+            r.start()
+            task = r._processor_task
+            r.stop()
+            await asyncio.sleep(0.05)
+            assert task.cancelled()
+
+        asyncio.run(_test())
+
+    def test_stop_without_start(self):
+        """Calling stop before start should not raise."""
+        r = EventRouter(max_queue_size=100, max_subscribers=10)
+        r.stop()  # no-op, should not raise
+
+    def test_subscribe_at_capacity(self):
+        async def _test():
+            r = EventRouter(max_queue_size=100, max_subscribers=1)
+            assert await r.subscribe("sub-1", MagicMock(), {}) is True
+            assert await r.subscribe("sub-2", MagicMock(), {}) is False
+            assert len(r.subscribers) == 1
+
+        asyncio.run(_test())
+
+    def test_publish_queue_full(self):
+        async def _test():
+            r = EventRouter(max_queue_size=1, max_subscribers=10)
+            event = EventResponse(
+                id="evt_1", event_type="quiz_started", source="test",
+                session_id=None, user_id=None, payload={}, timestamp="2026-01-01T00:00:00Z",
+            )
+            assert await r.publish(event) is True
+            assert await r.publish(event) is False
+
+        asyncio.run(_test())
+
+    def test_route_event_delivers_to_matching_subscriber(self):
+        async def _test():
+            r = EventRouter(max_queue_size=100, max_subscribers=10)
+            mock_ws = AsyncMock()
+            await r.subscribe("sub-1", mock_ws, {"event_types": ["quiz_started"]})
+
+            event = EventResponse(
+                id="evt_1", event_type="quiz_started", source="test",
+                session_id=None, user_id=None, payload={}, timestamp="2026-01-01T00:00:00Z",
+            )
+            await r._route_event(event)
+            mock_ws.send_json.assert_called_once()
+
+        asyncio.run(_test())
+
+    def test_route_event_skips_non_matching_subscriber(self):
+        async def _test():
+            r = EventRouter(max_queue_size=100, max_subscribers=10)
+            mock_ws = AsyncMock()
+            await r.subscribe("sub-1", mock_ws, {"event_types": ["answer_submitted"]})
+
+            event = EventResponse(
+                id="evt_1", event_type="quiz_started", source="test",
+                session_id=None, user_id=None, payload={}, timestamp="2026-01-01T00:00:00Z",
+            )
+            await r._route_event(event)
+            mock_ws.send_json.assert_not_called()
+
+        asyncio.run(_test())
+
+    def test_route_event_removes_disconnected_subscriber(self):
+        async def _test():
+            r = EventRouter(max_queue_size=100, max_subscribers=10)
+            mock_ws = AsyncMock()
+            mock_ws.send_json.side_effect = Exception("Connection closed")
+            await r.subscribe("sub-1", mock_ws, {})
+
+            event = EventResponse(
+                id="evt_1", event_type="quiz_started", source="test",
+                session_id=None, user_id=None, payload={}, timestamp="2026-01-01T00:00:00Z",
+            )
+            await r._route_event(event)
+            assert "sub-1" not in r.subscribers
+            assert "sub-1" not in r.filters
+
+        asyncio.run(_test())
+
+    def test_process_events_delivers_from_queue(self):
+        async def _test():
+            r = EventRouter(max_queue_size=100, max_subscribers=10)
+            mock_ws = AsyncMock()
+            await r.subscribe("sub-1", mock_ws, {})
+            r.start()
+
+            event = EventResponse(
+                id="evt_1", event_type="quiz_started", source="test",
+                session_id=None, user_id=None, payload={}, timestamp="2026-01-01T00:00:00Z",
+            )
+            await r.publish(event)
+            await asyncio.sleep(0.1)
+
+            mock_ws.send_json.assert_called_once()
+            r.stop()
+
+        asyncio.run(_test())
+
+
+# ── Compat Endpoints ───────────────────────────────────────────
+
+
+class TestCompatEndpoints:
+    def test_compat_get_events(self, client, sample_event):
+        client.post("/api/v1/events", json=sample_event)
+        response = client.get("/events")
+        assert response.status_code == 200
+        assert len(response.json()) == 1
+
+    def test_compat_get_event_by_id(self, client, sample_event):
+        published = client.post("/api/v1/events", json=sample_event).json()
+        response = client.get(f"/events/{published['id']}")
+        assert response.status_code == 200
+        assert response.json()["id"] == published["id"]
+
+    def test_compat_get_stats(self, client):
+        response = client.get("/stats")
+        assert response.status_code == 200
+        assert "total_events" in response.json()
+
+    def test_compat_delete_events(self, client, sample_event):
+        client.post("/api/v1/events", json=sample_event)
+        response = client.delete("/events")
+        assert response.status_code == 200
+        assert response.json()["deleted"] >= 1
+
+    def test_compat_list_event_types(self, client):
+        response = client.get("/event-types")
+        assert response.status_code == 200
+        assert "quiz_started" in response.json()
