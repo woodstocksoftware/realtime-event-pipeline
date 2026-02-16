@@ -8,15 +8,14 @@ import asyncio
 import json
 import sqlite3
 import uuid
-from datetime import datetime
-from typing import Dict, Set, Optional, List
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from pathlib import Path
-
 
 # ============================================================
 # DATABASE
@@ -35,7 +34,7 @@ def get_connection():
 def init_database():
     conn = get_connection()
     cursor = conn.cursor()
-    
+
     cursor.executescript("""
         -- Events table
         CREATE TABLE IF NOT EXISTS events (
@@ -48,7 +47,7 @@ def init_database():
             timestamp TEXT NOT NULL,
             processed INTEGER DEFAULT 0
         );
-        
+
         -- Subscriptions (for reconnection)
         CREATE TABLE IF NOT EXISTS subscriptions (
             id TEXT PRIMARY KEY,
@@ -57,20 +56,20 @@ def init_database():
             filters TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
-        
+
         -- Event statistics
         CREATE TABLE IF NOT EXISTS event_stats (
             event_type TEXT PRIMARY KEY,
             count INTEGER DEFAULT 0,
             last_seen TEXT
         );
-        
+
         CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
         CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
         CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
         CREATE INDEX IF NOT EXISTS idx_events_user ON events(user_id);
     """)
-    
+
     conn.commit()
     conn.close()
 
@@ -112,41 +111,41 @@ class SubscribeRequest(BaseModel):
 
 class EventRouter:
     """Manages event routing and subscriptions."""
-    
+
     def __init__(self):
         self.subscribers: Dict[str, WebSocket] = {}
         self.filters: Dict[str, dict] = {}
         self.event_queue: asyncio.Queue = asyncio.Queue()
         self._processor_task: Optional[asyncio.Task] = None
-    
+
     def start(self):
         """Start the event processor."""
         self._processor_task = asyncio.create_task(self._process_events())
-    
+
     def stop(self):
         """Stop the event processor."""
         if self._processor_task:
             self._processor_task.cancel()
-    
-    async def subscribe(self, subscriber_id: str, websocket: WebSocket, 
+
+    async def subscribe(self, subscriber_id: str, websocket: WebSocket,
                         filters: dict = None):
         """Add a subscriber."""
         await websocket.accept()
         self.subscribers[subscriber_id] = websocket
         self.filters[subscriber_id] = filters or {}
         print(f"📥 Subscriber added: {subscriber_id} with filters: {filters}")
-    
+
     def unsubscribe(self, subscriber_id: str):
         """Remove a subscriber."""
         if subscriber_id in self.subscribers:
             del self.subscribers[subscriber_id]
             del self.filters[subscriber_id]
             print(f"📤 Subscriber removed: {subscriber_id}")
-    
+
     async def publish(self, event: EventResponse):
         """Publish an event to the queue."""
         await self.event_queue.put(event)
-    
+
     async def _process_events(self):
         """Process events from the queue and route to subscribers."""
         while True:
@@ -157,44 +156,44 @@ class EventRouter:
                 break
             except Exception as e:
                 print(f"Error processing event: {e}")
-    
+
     async def _route_event(self, event: EventResponse):
         """Route an event to matching subscribers."""
         disconnected = []
-        
+
         for subscriber_id, websocket in self.subscribers.items():
             if self._matches_filter(event, self.filters[subscriber_id]):
                 try:
                     await websocket.send_json(event.model_dump())
                 except Exception:
                     disconnected.append(subscriber_id)
-        
+
         # Clean up disconnected subscribers
         for sub_id in disconnected:
             self.unsubscribe(sub_id)
-    
+
     def _matches_filter(self, event: EventResponse, filters: dict) -> bool:
         """Check if event matches subscriber's filters."""
         if not filters:
             return True
-        
+
         # Filter by event types
         if 'event_types' in filters and filters['event_types']:
             if event.event_type not in filters['event_types']:
                 return False
-        
+
         # Filter by session
         if 'session_id' in filters and filters['session_id']:
             if event.session_id != filters['session_id']:
                 return False
-        
+
         # Filter by user
         if 'user_id' in filters and filters['user_id']:
             if event.user_id != filters['user_id']:
                 return False
-        
+
         return True
-    
+
     def get_stats(self) -> dict:
         """Get router statistics."""
         return {
@@ -244,22 +243,22 @@ app.add_middleware(
 async def publish_event(event: Event):
     """
     Publish an event to the pipeline.
-    
+
     Events are persisted and routed to all matching subscribers.
     """
     conn = get_connection()
     cursor = conn.cursor()
-    
+
     event_id = f"evt_{uuid.uuid4().hex[:12]}"
-    timestamp = datetime.utcnow().isoformat() + "Z"
-    
+    timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
     # Persist event
     cursor.execute("""
         INSERT INTO events (id, event_type, source, session_id, user_id, payload, timestamp)
         VALUES (?, ?, ?, ?, ?, ?, ?)
     """, (event_id, event.event_type, event.source, event.session_id,
           event.user_id, json.dumps(event.payload), timestamp))
-    
+
     # Update stats
     cursor.execute("""
         INSERT INTO event_stats (event_type, count, last_seen)
@@ -268,10 +267,10 @@ async def publish_event(event: Event):
             count = count + 1,
             last_seen = excluded.last_seen
     """, (event.event_type, timestamp))
-    
+
     conn.commit()
     conn.close()
-    
+
     # Create response
     event_response = EventResponse(
         id=event_id,
@@ -282,10 +281,10 @@ async def publish_event(event: Event):
         payload=event.payload,
         timestamp=timestamp
     )
-    
+
     # Route to subscribers
     await router.publish(event_response)
-    
+
     return event_response
 
 
@@ -302,33 +301,33 @@ async def get_events(
     """
     conn = get_connection()
     cursor = conn.cursor()
-    
+
     query = "SELECT * FROM events WHERE 1=1"
     params = []
-    
+
     if event_type:
         query += " AND event_type = ?"
         params.append(event_type)
-    
+
     if session_id:
         query += " AND session_id = ?"
         params.append(session_id)
-    
+
     if user_id:
         query += " AND user_id = ?"
         params.append(user_id)
-    
+
     if since:
         query += " AND timestamp > ?"
         params.append(since)
-    
+
     query += " ORDER BY timestamp DESC LIMIT ?"
     params.append(limit)
-    
+
     cursor.execute(query, params)
     rows = cursor.fetchall()
     conn.close()
-    
+
     events = []
     for row in rows:
         events.append(EventResponse(
@@ -340,7 +339,7 @@ async def get_events(
             payload=json.loads(row['payload']) if row['payload'] else {},
             timestamp=row['timestamp']
         ))
-    
+
     return events
 
 
@@ -349,14 +348,14 @@ async def get_event(event_id: str):
     """Get a specific event by ID."""
     conn = get_connection()
     cursor = conn.cursor()
-    
+
     cursor.execute("SELECT * FROM events WHERE id = ?", (event_id,))
     row = cursor.fetchone()
     conn.close()
-    
+
     if not row:
         raise HTTPException(status_code=404, detail="Event not found")
-    
+
     return EventResponse(
         id=row['id'],
         event_type=row['event_type'],
@@ -373,24 +372,24 @@ async def get_stats():
     """Get pipeline statistics."""
     conn = get_connection()
     cursor = conn.cursor()
-    
+
     # Total events
     cursor.execute("SELECT COUNT(*) as total FROM events")
     total = cursor.fetchone()['total']
-    
+
     # Events by type
     cursor.execute("SELECT event_type, count, last_seen FROM event_stats ORDER BY count DESC")
     by_type = [dict(row) for row in cursor.fetchall()]
-    
+
     # Recent activity (last hour)
     cursor.execute("""
-        SELECT COUNT(*) as count FROM events 
+        SELECT COUNT(*) as count FROM events
         WHERE timestamp > datetime('now', '-1 hour')
     """)
     last_hour = cursor.fetchone()['count']
-    
+
     conn.close()
-    
+
     return {
         "total_events": total,
         "events_last_hour": last_hour,
@@ -400,21 +399,23 @@ async def get_stats():
 
 
 @app.delete("/events")
-async def clear_events(before: Optional[str] = Query(None, description="Clear events before this timestamp")):
+async def clear_events(
+    before: Optional[str] = Query(None, description="Clear events before this timestamp"),
+):
     """Clear old events (admin endpoint)."""
     conn = get_connection()
     cursor = conn.cursor()
-    
+
     if before:
         cursor.execute("DELETE FROM events WHERE timestamp < ?", (before,))
+        deleted = cursor.rowcount
     else:
         cursor.execute("DELETE FROM events")
+        deleted = cursor.rowcount
         cursor.execute("DELETE FROM event_stats")
-    
-    deleted = cursor.rowcount
     conn.commit()
     conn.close()
-    
+
     return {"deleted": deleted}
 
 
@@ -426,15 +427,15 @@ async def clear_events(before: Optional[str] = Query(None, description="Clear ev
 async def websocket_publish(websocket: WebSocket):
     """
     WebSocket endpoint for high-frequency event publishing.
-    
+
     Send JSON events, receive confirmation.
     """
     await websocket.accept()
-    
+
     try:
         while True:
             data = await websocket.receive_json()
-            
+
             try:
                 event = Event(**data)
                 response = await publish_event(event)
@@ -447,7 +448,7 @@ async def websocket_publish(websocket: WebSocket):
                     "status": "error",
                     "message": str(e)
                 })
-    
+
     except WebSocketDisconnect:
         pass
 
@@ -456,37 +457,37 @@ async def websocket_publish(websocket: WebSocket):
 async def websocket_subscribe(websocket: WebSocket):
     """
     WebSocket endpoint for subscribing to events.
-    
+
     Send a filter message first, then receive matching events.
     """
     subscriber_id = f"sub_{uuid.uuid4().hex[:8]}"
-    
+
     try:
         # Wait for filter configuration
         await websocket.accept()
-        
+
         # First message should be subscription config
         config = await websocket.receive_json()
         filters = {}
-        
+
         if 'event_types' in config:
             filters['event_types'] = config['event_types']
         if 'session_id' in config:
             filters['session_id'] = config['session_id']
         if 'user_id' in config:
             filters['user_id'] = config['user_id']
-        
+
         # Register with router (re-accept not needed, just update internal state)
         router.subscribers[subscriber_id] = websocket
         router.filters[subscriber_id] = filters
         print(f"📥 Subscriber added: {subscriber_id} with filters: {filters}")
-        
+
         await websocket.send_json({
             "status": "subscribed",
             "subscriber_id": subscriber_id,
             "filters": filters
         })
-        
+
         # Keep connection alive
         while True:
             # Handle ping/pong or filter updates
@@ -503,7 +504,7 @@ async def websocket_subscribe(websocket: WebSocket):
             except asyncio.TimeoutError:
                 # Send keepalive
                 await websocket.send_json({'type': 'keepalive'})
-    
+
     except WebSocketDisconnect:
         router.unsubscribe(subscriber_id)
     except Exception as e:
@@ -520,24 +521,24 @@ EVENT_TYPES = {
     "quiz_started": "Student started a quiz session",
     "quiz_completed": "Student completed/submitted quiz",
     "quiz_timeout": "Quiz timer expired",
-    
+
     # Answer events
     "answer_submitted": "Student submitted an answer",
     "answer_changed": "Student changed their answer",
-    
+
     # Navigation events
     "question_viewed": "Student viewed a question",
     "question_skipped": "Student skipped a question",
-    
+
     # Timer events
     "timer_started": "Session timer started",
     "timer_tick": "Timer tick (usually every second)",
     "timer_warning": "Timer warning threshold reached",
-    
+
     # Progress events
     "mastery_updated": "Student mastery level changed",
     "learning_gap_detected": "Learning gap identified",
-    
+
     # System events
     "session_created": "New session created",
     "session_ended": "Session ended",
