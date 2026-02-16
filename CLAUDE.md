@@ -7,27 +7,32 @@ Real-Time Event Pipeline — an async event pub/sub system for routing education
 ## Tech Stack
 
 - **Language:** Python 3.12+
-- **Framework:** FastAPI 0.109+ (ASGI)
+- **Framework:** FastAPI (ASGI)
 - **Server:** Uvicorn
-- **WebSocket:** `websockets` 12.0+
-- **Validation:** Pydantic 2.0+
-- **Database:** SQLite (file-based, `data/events.db`)
-- **Concurrency:** asyncio (Queue-based event processing)
+- **WebSocket:** `websockets`
+- **Validation:** Pydantic 2.x with field validators
+- **Database:** SQLite (file-based, configurable path)
+- **Rate Limiting:** slowapi
+- **Auth:** API key via `X-API-Key` header (opt-in)
+- **Concurrency:** asyncio (bounded queue event processing)
 
 ## Architecture
 
-Single-server pub/sub event router:
+```
+src/
+  config.py      — env var configuration
+  models.py      — Pydantic models + event type registry + input validation
+  database.py    — SQLite operations (init, insert, query, stats, delete)
+  router.py      — EventRouter (bounded pub/sub with subscriber limits)
+  middleware.py   — security headers, API key auth, WS connection limiter
+  server.py      — FastAPI app, endpoints (/api/v1/...), WebSocket handlers
+```
 
 ```
 Producers → REST/WebSocket → EventRouter → SQLite (persistence)
                                   ↓
                             WebSocket → Subscribers
 ```
-
-- **EventRouter** (`src/server.py:113`) — core pub/sub engine with async queue, subscriber registry, and filter matching
-- **REST API** — CRUD endpoints for events, stats, event types
-- **WebSocket** — `/ws/publish` for high-frequency ingestion, `/ws/subscribe` for real-time delivery
-- **Database** — 3 tables: `events`, `subscriptions`, `event_stats` with indexes on type, session, timestamp, user
 
 ## Commands
 
@@ -42,69 +47,63 @@ python -m uvicorn src.server:app --reload --port 8001
 # Run tests
 pytest tests/ -v
 
-# Lint
+# Lint + format
 ruff check src/ tests/
-
-# Format
 ruff format src/ tests/
+
+# Docker
+docker compose up --build
 ```
 
-## Event Schema
+## Configuration
 
-**Publishing (POST /events):**
-```json
-{
-  "event_type": "quiz_started",
-  "source": "quiz_engine",
-  "session_id": "session-123",
-  "user_id": "student-456",
-  "payload": {"quiz_id": "demo-quiz"}
-}
-```
+All settings via environment variables (see `.env.example`):
 
-**Response:**
-```json
-{
-  "id": "evt_a1b2c3d4e5f6",
-  "event_type": "quiz_started",
-  "source": "quiz_engine",
-  "session_id": "session-123",
-  "user_id": "student-456",
-  "payload": {"quiz_id": "demo-quiz"},
-  "timestamp": "2026-01-15T10:30:00Z"
-}
-```
-
-## Event Types
-
-| Category | Types |
-|----------|-------|
-| Quiz | `quiz_started`, `quiz_completed`, `quiz_timeout` |
-| Answer | `answer_submitted`, `answer_changed` |
-| Navigation | `question_viewed`, `question_skipped` |
-| Timer | `timer_started`, `timer_tick`, `timer_warning` |
-| Progress | `mastery_updated`, `learning_gap_detected` |
-| System | `session_created`, `session_ended`, `error_occurred` |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | `8001` | Server port |
+| `DATABASE_PATH` | `data/events.db` | SQLite file location |
+| `CORS_ORIGINS` | `*` | Comma-separated allowed origins |
+| `REQUIRE_AUTH` | `false` | Enable API key authentication |
+| `API_KEY` | (empty) | API key when auth is enabled |
+| `LOG_LEVEL` | `INFO` | Logging level |
+| `MAX_QUEUE_SIZE` | `10000` | Event queue bound |
+| `MAX_SUBSCRIBERS` | `5000` | Max WebSocket subscribers |
+| `MAX_WS_MESSAGE_BYTES` | `1048576` | Max WebSocket message size (1 MB) |
+| `MAX_PAYLOAD_KEYS` | `50` | Max keys in event payload |
+| `RATE_LIMIT_PUBLISH` | `200/minute` | Rate limit for publish endpoints |
 
 ## API Endpoints
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| POST | `/events` | Publish event |
-| GET | `/events` | Query events (filters: event_type, session_id, user_id, limit, since) |
-| GET | `/events/{id}` | Get single event |
-| GET | `/stats` | Pipeline statistics |
-| GET | `/event-types` | List registered event types |
-| DELETE | `/events` | Clear events (optional `before` timestamp) |
-| WS | `/ws/publish` | High-frequency publish |
-| WS | `/ws/subscribe` | Subscribe with filters |
+All REST endpoints are available at `/api/v1/...` (preferred) and `/...` (backwards-compatible).
 
-## Integration
+| Method | Path | Auth | Purpose |
+|--------|------|------|---------|
+| GET | `/health` | No | Health check |
+| GET | `/readiness` | No | Readiness check (DB connectivity) |
+| POST | `/api/v1/events` | Yes* | Publish event (returns 201) |
+| GET | `/api/v1/events` | Yes* | Query events with filters |
+| GET | `/api/v1/events/{id}` | Yes* | Get single event |
+| GET | `/api/v1/stats` | Yes* | Pipeline statistics |
+| GET | `/api/v1/event-types` | No | List registered event types |
+| DELETE | `/api/v1/events` | Admin* | Clear events |
+| WS | `/ws/publish` | Yes* | High-frequency publish |
+| WS | `/ws/subscribe` | Yes* | Subscribe with filters |
 
-Part of the ed-tech platform suite. Producers (quiz engine, student app) publish events; consumers (dashboards, analytics, progress tracker) subscribe via WebSocket.
+*Auth only enforced when `REQUIRE_AUTH=true`.
+
+## Event Types
+
+15 registered types: `quiz_started`, `quiz_completed`, `quiz_timeout`, `answer_submitted`, `answer_changed`, `question_viewed`, `question_skipped`, `timer_started`, `timer_tick`, `timer_warning`, `mastery_updated`, `learning_gap_detected`, `session_created`, `session_ended`, `error_occurred`.
+
+Event types are validated on publish — unknown types are rejected with 422.
 
 ## Key Files
 
-- `src/server.py` — entire application (models, router, API, WebSocket handlers)
-- `tests/test_server.py` — API and router tests
-- `data/events.db` — SQLite database (gitignored)
+- `src/server.py` — FastAPI app, all endpoints and WebSocket handlers
+- `src/config.py` — all configuration from env vars
+- `src/models.py` — Pydantic models with validation, event type registry
+- `src/database.py` — SQLite operations
+- `src/router.py` — EventRouter (pub/sub engine)
+- `src/middleware.py` — security headers, auth, WS limiter
+- `tests/test_server.py` — 45 tests (API, auth, validation, security, WebSocket)
