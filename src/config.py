@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 # Server
-HOST = os.getenv("HOST", "0.0.0.0")
+HOST = os.getenv("HOST", "0.0.0.0")  # nosec B104 — intentional for containerized deployment
 PORT = int(os.getenv("PORT", "8001"))
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 
