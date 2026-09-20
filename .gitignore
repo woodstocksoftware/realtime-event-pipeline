@@ -7,3 +7,13 @@ __pycache__/
 .ruff_cache/
 .coverage
 .env
+
+# Build/test artifacts
+report/
+coverage/
+.coverage.*
+htmlcov/
+.firecrawl/
+*.tsbuildinfo
+.claude/settings.local.json
+.claude/worktrees/
