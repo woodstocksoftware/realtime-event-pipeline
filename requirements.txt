@@ -1,6 +1,15 @@
-fastapi==0.129.0
+fastapi==0.141.1
 uvicorn[standard]==0.40.0
 websockets==16.0
 pydantic==2.12.5
 python-dateutil==2.9.0.post0
 slowapi==0.1.9
+starlette==1.7.0
+anyio==4.15.1
+click==8.5.0
+idna==3.20
+msgpack==1.2.2
+pygments==2.21.0
+python-dotenv==1.2.3
+requests==2.34.2
+urllib3==2.8.0
